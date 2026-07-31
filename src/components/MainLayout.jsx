@@ -50,7 +50,7 @@ const MainLayout = ({
   const searchTimerRef = useRef(null);
   const searchInputRef = useRef(null);
 
-  const VERSION = "2.5";
+  const VERSION = "2.5.1";
 
   const hasNewVersion =
     typeof window !== "undefined" &&

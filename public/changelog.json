@@ -1,6 +1,6 @@
 [
   {
-    "version": "2.5",
+    "version": "2.5.1",
     "notes": [
       "Migrate platforms for backend compatibility.",
       "Fix parsing issues for clean AI output",
