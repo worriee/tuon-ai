@@ -1,12 +1,8 @@
-[
-  {
-    "relation": ["delegate_permission/common.handle_all_urls"],
-    "target": {
-      "namespace": "android_app",
-      "package_name": "com.onrender.tuonai_worrie.twa",
-      "sha256_cert_fingerprints": [
-        "74:0F:46:2F:1D:57:FB:D3:68:73:47:4F:7B:A7:35:44:6A:DC:62:ED:82:0D:89:37:5F:BB:7D:B1:23:4B:B5:45"
-      ]
-    }
-  }
-]
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.tuonai.worrie",
+        "sha256_cert_fingerprints": ["44:A7:BF:3B:6E:43:9F:E6:05:EE:6C:19:40:AD:A3:CD:C8:D2:E3:C6:66:2B:EE:AB:75:FC:C1:1F:57:4F:D1:63"]
+      }
+    }]

@@ -3,13 +3,13 @@
 <p align="center"> <strong>T</strong>o <strong>U</strong>nderstand <strong>O</strong>wn <strong>N</strong>avigation.</p>
 
 <p align="center">
-    <img src="https://badgen.net/badge/version/2.5/blue" height="30" />
+    <img src="https://badgen.net/badge/version/2.5.1/blue" height="30" />
     <img src="https://badgen.net/badge/license/MIT/red" height="30" />
     <img src="https://badgen.net/badge/PWA/ready/orange" height="30" />
 </p>
 
-**URL:** [Visit](https://tuonai-worrie.onrender.com)\
-**APPLICATION:** [Download](https://github.com/worriee/quizmakerapp/releases)
+**URL:** [Visit](https://tuon-ai.vercel.app)\
+**APPLICATION:** [Download](https://github.com/worriee/tuon-ai/releases)
 
 ---
 
