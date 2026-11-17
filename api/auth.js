@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
-import { createClient } from '@supabase/supabase-js';
+import postgres from 'postgres';
 import { validatePassword } from './validatePassword.js';
 import { sendVerificationEmail, sendPasswordResetEmail, sendLockoutEmail } from './email.js';
 
@@ -40,11 +40,8 @@ function checkAccountLock(user) {
  */
 async function recordFailedLogin(email) {
   try {
-    const { data: user } = await supabaseService
-      .from('profiles')
-      .select('failed_login_attempts')
-      .eq('email', email)
-      .single();
+    const [user] = await sql`
+      select failed_login_attempts from profiles where email = ${email}`;
 
     const attempts = (user?.failed_login_attempts || 0) + 1;
     const updates = { failed_login_attempts: attempts };
@@ -55,10 +52,10 @@ async function recordFailedLogin(email) {
       sendLockoutEmail(email, updates.locked_until).catch(() => {});
     }
 
-    await supabaseService
-      .from('profiles')
-      .update(updates)
-      .eq('email', email);
+    await sql`
+      update profiles
+      set failed_login_attempts = ${attempts}, locked_until = ${updates.locked_until ?? null}
+      where email = ${email}`;
   } catch (err) {
     console.error('[Auth] Failed to record login attempt:', err.message || err);
   }
@@ -70,29 +67,20 @@ async function recordFailedLogin(email) {
  */
 async function resetFailedLogins(email) {
   try {
-    await supabaseService
-      .from('profiles')
-      .update({ failed_login_attempts: 0, locked_until: null })
-      .eq('email', email);
+    await sql`
+      update profiles
+      set failed_login_attempts = 0, locked_until = null
+      where email = ${email}`;
   } catch (err) {
     console.error('[Auth] Failed to reset login attempts:', err.message || err);
   }
 }
 
-// Server-side Supabase client using service_role key to bypass RLS
-const supabaseService = createClient(
-  process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  }
-);
+// Postgres client — single pooled connection over Neon (DATABASE_URL includes sslmode=require)
+const sql = postgres(process.env.DATABASE_URL, { max: 10, idle_timeout: 30 });
 
-if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error('SUPABASE_SERVICE_ROLE_KEY environment variable is required');
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL environment variable is required');
 }
 
 const authenticate = (req, res, next) => {
@@ -128,11 +116,8 @@ router.post('/signup', async (req, res) => {
     }
 
     // Check if user already exists
-    const { data: existingUser } = await supabaseService
-      .from('profiles')
-      .select('id')
-      .eq('email', email)
-      .single();
+    const [existingUser] = await sql`
+      select id from profiles where email = ${email}`;
 
     if (existingUser) {
       return res.status(400).json({ error: 'An account with this email already exists' });
@@ -145,23 +130,10 @@ router.post('/signup', async (req, res) => {
     const verificationToken = generateToken();
 
     // Create user in profiles table
-    const { data: newUser, error: insertError } = await supabaseService
-      .from('profiles')
-      .insert([
-        {
-          email,
-          password_hash: passwordHash,
-          email_verified: false,
-          verification_token: verificationToken,
-        },
-      ])
-      .select()
-      .single();
-
-    if (insertError) {
-      console.error('Error creating user:', insertError.message || insertError);
-      return res.status(500).json({ error: 'Failed to create account' });
-    }
+    const [newUser] = await sql`
+      insert into profiles (email, password_hash, email_verified, verification_token)
+      values (${email}, ${passwordHash}, false, ${verificationToken})
+      returning id, email`;
 
     // SEC-003: Send verification email (fire-and-forget)
     sendVerificationEmail(email, verificationToken).catch(() => {});
@@ -202,13 +174,10 @@ router.post('/login', async (req, res) => {
     }
 
     // Find user
-    const { data: user, error: fetchError } = await supabaseService
-      .from('profiles')
-      .select('*')
-      .eq('email', email)
-      .single();
+    const [user] = await sql`
+      select * from profiles where email = ${email}`;
 
-    if (fetchError || !user) {
+    if (!user) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
@@ -269,13 +238,10 @@ router.post('/logout', (req, res) => {
 // GET /api/auth/me
 router.get('/me', authenticate, async (req, res) => {
   try {
-    const { data: user, error: fetchError } = await supabaseService
-      .from('profiles')
-      .select('id, email, email_verified')
-      .eq('id', req.user.id)
-      .single();
+    const [user] = await sql`
+      select id, email, email_verified from profiles where id = ${req.user.id}`;
 
-    if (fetchError || !user) {
+    if (!user) {
       return res.status(401).json({ error: 'User not found' });
     }
 
@@ -302,28 +268,17 @@ router.post('/verify-email', async (req, res) => {
       return res.status(400).json({ error: 'Verification token is required' });
     }
 
-    const { data: user, error: fetchError } = await supabaseService
-      .from('profiles')
-      .select('id, verification_token')
-      .eq('verification_token', token)
-      .single();
+    const [user] = await sql`
+      select id, verification_token from profiles where verification_token = ${token}`;
 
-    if (fetchError || !user) {
+    if (!user) {
       return res.status(400).json({ error: 'Invalid or expired verification token' });
     }
 
-    const { error: updateError } = await supabaseService
-      .from('profiles')
-      .update({
-        email_verified: true,
-        verification_token: null,
-      })
-      .eq('id', user.id);
-
-    if (updateError) {
-      console.error('[Auth] Failed to verify email:', updateError.message || updateError);
-      return res.status(500).json({ error: 'Failed to verify email' });
-    }
+    await sql`
+      update profiles
+      set email_verified = true, verification_token = null
+      where id = ${user.id}`;
 
     res.json({ message: 'Email verified successfully' });
   } catch {
@@ -341,11 +296,8 @@ router.post('/forgot-password', async (req, res) => {
       return res.json({ message: 'If an account exists with this email, a reset link has been sent.' });
     }
 
-    const { data: user } = await supabaseService
-      .from('profiles')
-      .select('id')
-      .eq('email', email)
-      .single();
+    const [user] = await sql`
+      select id from profiles where email = ${email}`;
 
     if (!user) {
       // Return success even if user not found (prevent email enumeration)
@@ -355,13 +307,10 @@ router.post('/forgot-password', async (req, res) => {
     const resetToken = generateToken();
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
-    await supabaseService
-      .from('profiles')
-      .update({
-        reset_token: resetToken,
-        reset_token_expires: expiresAt,
-      })
-      .eq('id', user.id);
+    await sql`
+      update profiles
+      set reset_token = ${resetToken}, reset_token_expires = ${expiresAt}
+      where id = ${user.id}`;
 
     await sendPasswordResetEmail(email, resetToken);
 
@@ -389,13 +338,10 @@ router.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: `Password must have: ${passwordCheck.errors.join(', ')}` });
     }
 
-    const { data: user, error: fetchError } = await supabaseService
-      .from('profiles')
-      .select('id, reset_token_expires')
-      .eq('reset_token', token)
-      .single();
+    const [user] = await sql`
+      select id, reset_token_expires from profiles where reset_token = ${token}`;
 
-    if (fetchError || !user) {
+    if (!user) {
       return res.status(400).json({ error: 'Invalid or expired reset token' });
     }
 
@@ -406,21 +352,14 @@ router.post('/reset-password', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const { error: updateError } = await supabaseService
-      .from('profiles')
-      .update({
-        password_hash: passwordHash,
-        reset_token: null,
-        reset_token_expires: null,
-        failed_login_attempts: 0,
-        locked_until: null,
-      })
-      .eq('id', user.id);
-
-    if (updateError) {
-      console.error('[Auth] Failed to reset password:', updateError.message || updateError);
-      return res.status(500).json({ error: 'Failed to reset password' });
-    }
+    await sql`
+      update profiles
+      set password_hash = ${passwordHash},
+          reset_token = null,
+          reset_token_expires = null,
+          failed_login_attempts = 0,
+          locked_until = null
+      where id = ${user.id}`;
 
     res.json({ message: 'Password reset successfully. You can now log in.' });
   } catch {
@@ -428,4 +367,4 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-export { router as authRouter, supabaseService, authenticate };
+export { router as authRouter, sql, authenticate };

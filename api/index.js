@@ -4,7 +4,7 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import path from "path";
 import { handleChat, handleChatStream } from "./ai.js";
-import { authRouter, supabaseService, authenticate } from "./auth.js";
+import { authRouter, sql, authenticate } from "./auth.js";
 import jwt from "jsonwebtoken";
 import {
   sanitizeMessage,
@@ -28,11 +28,11 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
-// Content-Security-Policy for Render — allows fonts, Supabase, and the service worker
+// Content-Security-Policy for Render — allows fonts and the service worker
 app.use((req, res, next) => {
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://*.supabase.co; manifest-src 'self'; worker-src 'self'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'",
   );
   next();
 });
@@ -72,22 +72,19 @@ const chatLimiter = rateLimit({
 
 app.use("/api/auth", authLimiter, authRouter);
 
-// Session management routes (bypass RLS via supabaseService)
+// Session management routes (direct Postgres over Neon — backend is the only trust boundary)
 const sessionRouter = express.Router();
 sessionRouter.use(cookieParser());
 
 // GET /api/sessions - list all sessions for current user
 sessionRouter.get("/", authenticate, async (req, res) => {
   try {
-    const { data, error } = await supabaseService
-      .from("chat_sessions")
-      .select("*")
-      .eq("user_id", req.user.id)
-      .order("pinned", { ascending: false })
-      .order("created_at", { ascending: false });
+    const sessions = await sql`
+      select * from chat_sessions
+      where user_id = ${req.user.id}
+      order by pinned desc, created_at desc`;
 
-    if (error) throw error;
-    res.json({ sessions: data || [] });
+    res.json({ sessions: sessions || [] });
   } catch (error) {
     console.error("[Session] List error:", error.message || error);
     res
@@ -108,30 +105,24 @@ sessionRouter.get("/search", authenticate, async (req, res) => {
     const searchTerm = `%${query.trim()}%`;
 
     // Search session titles
-    const { data: titleMatches } = await supabaseService
-      .from("chat_sessions")
-      .select("id, topic, created_at, pinned")
-      .eq("user_id", req.user.id)
-      .ilike("topic", searchTerm)
-      .order("created_at", { ascending: false });
+    const titleMatches = await sql`
+      select id, topic, created_at, pinned from chat_sessions
+      where user_id = ${req.user.id} and topic ilike ${searchTerm}
+      order by created_at desc`;
 
     // Search message content for matching session IDs
-    const { data: contentMatches } = await supabaseService
-      .from("messages")
-      .select("session_id")
-      .ilike("content", searchTerm);
+    const contentRows = await sql`
+      select distinct session_id from messages
+      where content ilike ${searchTerm}`;
 
     // Get unique session details from content matches
     let contentSessions = [];
-    if (contentMatches && contentMatches.length > 0) {
-      const contentSessionIds = [...new Set(contentMatches.map((m) => m.session_id))];
-      const { data: sessions } = await supabaseService
-        .from("chat_sessions")
-        .select("id, topic, created_at, pinned")
-        .eq("user_id", req.user.id)
-        .in("id", contentSessionIds)
-        .order("created_at", { ascending: false });
-      contentSessions = sessions || [];
+    if (contentRows.length > 0) {
+      const contentSessionIds = contentRows.map((m) => m.session_id);
+      contentSessions = await sql`
+        select id, topic, created_at, pinned from chat_sessions
+        where user_id = ${req.user.id} and id in ${sql(contentSessionIds)}
+        order by created_at desc`;
     }
 
     res.json({
@@ -148,21 +139,19 @@ sessionRouter.get("/search", authenticate, async (req, res) => {
 // GET /api/session/:id - get a single session (reads from messages table)
 sessionRouter.get("/:id", authenticate, async (req, res) => {
   try {
-    const { data: session, error } = await supabaseService
-      .from("chat_sessions")
-      .select("*")
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .single();
+    const [session] = await sql`
+      select * from chat_sessions
+      where id = ${req.params.id} and user_id = ${req.user.id}`;
 
-    if (error) throw error;
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
 
     // Load messages from the new table instead of the history blob
-    const { data: messageRows } = await supabaseService
-      .from("messages")
-      .select("*")
-      .eq("session_id", req.params.id)
-      .order("position", { ascending: true });
+    const messageRows = await sql`
+      select * from messages
+      where session_id = ${req.params.id}
+      order by position asc`;
 
     // Convert to the SDK format that useChat.loadSessionData expects
     const history = (messageRows || []).map((row) => ({
@@ -189,29 +178,22 @@ sessionRouter.post("/create", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Topic or history is required" });
     }
 
-    const { data, error } = await supabaseService
-      .from("chat_sessions")
-      .insert([
-        {
-          user_id: req.user.id,
-          topic: topic || "New Chat",
-        },
-      ])
-      .select();
-
-    if (error) throw error;
-    const session = data[0];
+    const [session] = await sql`
+      insert into chat_sessions (user_id, topic)
+      values (${req.user.id}, ${topic || "New Chat"})
+      returning *`;
 
     // Dual-write: insert into messages table if history exists
     if (history && history.length > 0) {
-      const rowsToInsert = history.map((msg, index) => ({
-        session_id: session.id,
-        role: msg.role,
-        content: msg.parts[0].text,
-        position: index,
-      }));
-
-      await supabaseService.from("messages").insert(rowsToInsert);
+      await sql`
+        insert into messages (session_id, role, content, position)
+        select u.sid, u.role, u.content, u.pos
+        from unnest(
+          ${history.map(() => session.id)}::uuid[],
+          ${history.map((msg) => msg.role)}::text[],
+          ${history.map((msg) => msg.parts[0].text)}::text[],
+          ${history.map((_, index) => index)}::int[]
+        ) as u(sid, role, content, pos)`;
     }
 
     res.status(201).json({ session });
@@ -228,33 +210,28 @@ sessionRouter.post("/:id/update", authenticate, async (req, res) => {
   try {
     const { history, topic } = req.body;
 
-    const { data, error } = await supabaseService
-      .from("chat_sessions")
-      .update({ topic })
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .select();
-
-    if (error) throw error;
+    const [session] = await sql`
+      update chat_sessions
+      set topic = ${topic}
+      where id = ${req.params.id} and user_id = ${req.user.id}
+      returning *`;
 
     // Dual-write: replace all messages for this session
     if (history && Array.isArray(history)) {
-      await supabaseService
-        .from("messages")
-        .delete()
-        .eq("session_id", req.params.id);
+      await sql`delete from messages where session_id = ${req.params.id}`;
 
-      const rowsToInsert = history.map((msg, index) => ({
-        session_id: req.params.id,
-        role: msg.role,
-        content: msg.parts[0].text,
-        position: index,
-      }));
-
-      await supabaseService.from("messages").insert(rowsToInsert);
+      await sql`
+        insert into messages (session_id, role, content, position)
+        select u.sid, u.role, u.content, u.pos
+        from unnest(
+          ${history.map(() => req.params.id)}::uuid[],
+          ${history.map((msg) => msg.role)}::text[],
+          ${history.map((msg) => msg.parts[0].text)}::text[],
+          ${history.map((_, index) => index)}::int[]
+        ) as u(sid, role, content, pos)`;
     }
 
-    res.json({ session: data[0] });
+    res.json({ session });
   } catch (error) {
     console.error("[Session] Update error:", error.message || error);
     res
@@ -272,15 +249,13 @@ sessionRouter.post("/:id/rename", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Topic is required" });
     }
 
-    const { data, error } = await supabaseService
-      .from("chat_sessions")
-      .update({ topic: topic.trim() })
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .select();
+    const [session] = await sql`
+      update chat_sessions
+      set topic = ${topic.trim()}
+      where id = ${req.params.id} and user_id = ${req.user.id}
+      returning *`;
 
-    if (error) throw error;
-    res.json({ session: data[0] });
+    res.json({ session });
   } catch (error) {
     console.error("[Session] Rename error:", error.message || error);
     res
@@ -292,24 +267,21 @@ sessionRouter.post("/:id/rename", authenticate, async (req, res) => {
 // POST /api/session/:id/pin - toggle pin
 sessionRouter.post("/:id/pin", authenticate, async (req, res) => {
   try {
-    const { data: existing, error: fetchError } = await supabaseService
-      .from("chat_sessions")
-      .select("pinned")
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .single();
+    const [existing] = await sql`
+      select pinned from chat_sessions
+      where id = ${req.params.id} and user_id = ${req.user.id}`;
 
-    if (fetchError) throw fetchError;
+    if (!existing) {
+      return res.status(404).json({ error: "Session not found" });
+    }
 
-    const { data, error } = await supabaseService
-      .from("chat_sessions")
-      .update({ pinned: !existing.pinned })
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .select();
+    const [session] = await sql`
+      update chat_sessions
+      set pinned = ${!existing.pinned}
+      where id = ${req.params.id} and user_id = ${req.user.id}
+      returning *`;
 
-    if (error) throw error;
-    res.json({ session: data[0] });
+    res.json({ session });
   } catch (error) {
     console.error("[Session] Pin error:", error.message || error);
     res.status(500).json({ error: error.message || "Failed to toggle pin" });
@@ -319,13 +291,10 @@ sessionRouter.post("/:id/pin", authenticate, async (req, res) => {
 // DELETE /api/session/:id - delete a session
 sessionRouter.delete("/:id", authenticate, async (req, res) => {
   try {
-    const { error } = await supabaseService
-      .from("chat_sessions")
-      .delete()
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id);
+    await sql`
+      delete from chat_sessions
+      where id = ${req.params.id} and user_id = ${req.user.id}`;
 
-    if (error) throw error;
     res.json({ ok: true });
   } catch (error) {
     console.error("[Session] Delete error:", error.message || error);
@@ -349,34 +318,29 @@ sessionRouter.post("/messages/bulk", authenticate, async (req, res) => {
     }
 
     // Verify the session belongs to this user
-    const { data: session } = await supabaseService
-      .from("chat_sessions")
-      .select("id")
-      .eq("id", sessionId)
-      .eq("user_id", req.user.id)
-      .single();
+    const [session] = await sql`
+      select id from chat_sessions
+      where id = ${sessionId} and user_id = ${req.user.id}`;
 
     if (!session) {
       return res.status(404).json({ error: "Session not found" });
     }
 
     // Delete old messages, then re-insert all
-    await supabaseService.from("messages").delete().eq("session_id", sessionId);
+    await sql`delete from messages where session_id = ${sessionId}`;
 
-    const rowsToInsert = msgs.map((msg, index) => ({
-      session_id: sessionId,
-      role: msg.role,
-      content: msg.parts[0].text,
-      position: index,
-    }));
+    const inserted = await sql`
+      insert into messages (session_id, role, content, position)
+      select u.sid, u.role, u.content, u.pos
+      from unnest(
+        ${msgs.map(() => sessionId)}::uuid[],
+        ${msgs.map((msg) => msg.role)}::text[],
+        ${msgs.map((msg) => msg.parts[0].text)}::text[],
+        ${msgs.map((_, index) => index)}::int[]
+      ) as u(sid, role, content, pos)
+      returning id`;
 
-    const { data, error } = await supabaseService
-      .from("messages")
-      .insert(rowsToInsert)
-      .select();
-
-    if (error) throw error;
-    res.json({ count: data.length });
+    res.json({ count: inserted.length });
   } catch (error) {
     console.error("[Messages] Bulk insert error:", error.message || error);
     res.status(500).json({ error: error.message || "Failed to save messages" });
@@ -386,13 +350,10 @@ sessionRouter.post("/messages/bulk", authenticate, async (req, res) => {
 // GET /api/messages/:sessionId - load all messages for a session
 sessionRouter.get("/messages/:sessionId", authenticate, async (req, res) => {
   try {
-    const { data, error } = await supabaseService
-      .from("messages")
-      .select("*")
-      .eq("session_id", req.params.sessionId)
-      .order("position", { ascending: true });
-
-    if (error) throw error;
+    const data = await sql`
+      select * from messages
+      where session_id = ${req.params.sessionId}
+      order by position asc`;
 
     // Convert to the SDK format the frontend expects
     const history = (data || []).map((row) => ({
