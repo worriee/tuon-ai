@@ -4,7 +4,7 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import path from "path";
 import { handleChat, handleChatStream } from "./ai.js";
-import { authRouter, sql, authenticate } from "./auth.js";
+import { authRouter, authenticate, reserveUser } from "./auth.js";
 import jwt from "jsonwebtoken";
 import {
   sanitizeMessage,
@@ -76,9 +76,23 @@ app.use("/api/auth", authLimiter, authRouter);
 const sessionRouter = express.Router();
 sessionRouter.use(cookieParser());
 
+// Attaches a reserved connection with app.user_id set — RLS scopes every query to this user
+const withUserSql = (req, res, next) => {
+  reserveUser(res, req.user.id)
+    .then((sql) => {
+      req.sql = sql;
+      next();
+    })
+    .catch((error) => {
+      console.error("[SQL] Reserve error:", error.message || error);
+      res.status(500).json({ error: "Something went wrong." });
+    });
+};
+
 // GET /api/sessions - list all sessions for current user
-sessionRouter.get("/", authenticate, async (req, res) => {
+sessionRouter.get("/", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const sessions = await sql`
       select * from chat_sessions
       where user_id = ${req.user.id}
@@ -95,8 +109,9 @@ sessionRouter.get("/", authenticate, async (req, res) => {
 
 // GET /api/sessions/search?q=... - search sessions by title and message content
 // IMPORTANT: Must be registered BEFORE /:id to prevent Express matching "search" as a session ID
-sessionRouter.get("/search", authenticate, async (req, res) => {
+sessionRouter.get("/search", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const query = req.query.q;
     if (!query || typeof query !== "string" || query.trim().length === 0) {
       return res.json({ titleMatches: [], contentMatches: [] });
@@ -137,8 +152,9 @@ sessionRouter.get("/search", authenticate, async (req, res) => {
 });
 
 // GET /api/session/:id - get a single session (reads from messages table)
-sessionRouter.get("/:id", authenticate, async (req, res) => {
+sessionRouter.get("/:id", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const [session] = await sql`
       select * from chat_sessions
       where id = ${req.params.id} and user_id = ${req.user.id}`;
@@ -170,8 +186,9 @@ sessionRouter.get("/:id", authenticate, async (req, res) => {
 });
 
 // POST /api/session/create - create a new session (dual-write)
-sessionRouter.post("/create", authenticate, async (req, res) => {
+sessionRouter.post("/create", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const { topic, history } = req.body;
 
     if (!topic && !history) {
@@ -206,8 +223,9 @@ sessionRouter.post("/create", authenticate, async (req, res) => {
 });
 
 // POST /api/session/:id/update - update session history/topic (dual-write)
-sessionRouter.post("/:id/update", authenticate, async (req, res) => {
+sessionRouter.post("/:id/update", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const { history, topic } = req.body;
 
     const [session] = await sql`
@@ -241,8 +259,9 @@ sessionRouter.post("/:id/update", authenticate, async (req, res) => {
 });
 
 // POST /api/session/:id/rename - rename a session
-sessionRouter.post("/:id/rename", authenticate, async (req, res) => {
+sessionRouter.post("/:id/rename", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const { topic } = req.body;
 
     if (!topic || typeof topic !== "string" || topic.trim().length === 0) {
@@ -265,8 +284,9 @@ sessionRouter.post("/:id/rename", authenticate, async (req, res) => {
 });
 
 // POST /api/session/:id/pin - toggle pin
-sessionRouter.post("/:id/pin", authenticate, async (req, res) => {
+sessionRouter.post("/:id/pin", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const [existing] = await sql`
       select pinned from chat_sessions
       where id = ${req.params.id} and user_id = ${req.user.id}`;
@@ -289,8 +309,9 @@ sessionRouter.post("/:id/pin", authenticate, async (req, res) => {
 });
 
 // DELETE /api/session/:id - delete a session
-sessionRouter.delete("/:id", authenticate, async (req, res) => {
+sessionRouter.delete("/:id", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     await sql`
       delete from chat_sessions
       where id = ${req.params.id} and user_id = ${req.user.id}`;
@@ -307,8 +328,9 @@ sessionRouter.delete("/:id", authenticate, async (req, res) => {
 // ---- Phase 1: Message routes (dual-write support) ----
 
 // POST /api/messages/bulk - batch insert messages for a session
-sessionRouter.post("/messages/bulk", authenticate, async (req, res) => {
+sessionRouter.post("/messages/bulk", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const { sessionId, messages: msgs } = req.body;
 
     if (!sessionId || !Array.isArray(msgs) || msgs.length === 0) {
@@ -348,8 +370,9 @@ sessionRouter.post("/messages/bulk", authenticate, async (req, res) => {
 });
 
 // GET /api/messages/:sessionId - load all messages for a session
-sessionRouter.get("/messages/:sessionId", authenticate, async (req, res) => {
+sessionRouter.get("/messages/:sessionId", authenticate, withUserSql, async (req, res) => {
   try {
+    const sql = req.sql;
     const data = await sql`
       select * from messages
       where session_id = ${req.params.sessionId}

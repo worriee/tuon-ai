@@ -38,7 +38,7 @@ function checkAccountLock(user) {
  * recordFailedLogin: Increments failed login attempts. Locks account after MAX_FAILED_ATTEMPTS.
  * @param {string} email - The user's email address.
  */
-async function recordFailedLogin(email) {
+async function recordFailedLogin(sql, email) {
   try {
     const [user] = await sql`
       select failed_login_attempts from profiles where email = ${email}`;
@@ -65,7 +65,7 @@ async function recordFailedLogin(email) {
  * resetFailedLogins: Clears failed attempts and lockout on successful login.
  * @param {string} email - The user's email address.
  */
-async function resetFailedLogins(email) {
+async function resetFailedLogins(sql, email) {
   try {
     await sql`
       update profiles
@@ -81,6 +81,38 @@ const sql = postgres(process.env.DATABASE_URL, { max: 10, idle_timeout: 30 });
 
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL environment variable is required');
+}
+
+// Reserved per-request connections carry RLS context via GUCs set once per reservation
+const reserve = () => sql.reserve();
+
+// release on 'finish' AND 'close' (client aborts); done-guard makes double-fire a no-op
+const attachRelease = (res, conn) => {
+  let done = false;
+  const release = () => {
+    if (!done) {
+      done = true;
+      conn.release();
+    }
+  };
+  res.on('finish', release);
+  res.on('close', release);
+};
+
+// Signup/login/token ops look users up by email or token across accounts — run as service
+async function reserveService(res) {
+  const conn = await reserve();
+  attachRelease(res, conn);
+  await conn`select set_config('app.service', 'on', false)`;
+  return conn;
+}
+
+async function reserveUser(res, userId) {
+  const conn = await reserve();
+  attachRelease(res, conn);
+  // GUCs are session-scoped and backends are pooled — clear stale service flag on reuse
+  await conn`select set_config('app.user_id', ${userId}, false), set_config('app.service', 'off', false)`;
+  return conn;
 }
 
 const authenticate = (req, res, next) => {
@@ -100,6 +132,7 @@ const authenticate = (req, res, next) => {
 // POST /api/auth/signup
 router.post('/signup', async (req, res) => {
   try {
+    const sql = await reserveService(res);
     const { email, password } = req.body;
 
     if (!email || !password) {
@@ -163,6 +196,7 @@ router.post('/signup', async (req, res) => {
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
   try {
+    const sql = await reserveService(res);
     const { email, password } = req.body;
 
     if (!email || !password) {
@@ -195,12 +229,12 @@ router.post('/login', async (req, res) => {
     // Verify password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
     if (!isPasswordValid) {
-      await recordFailedLogin(email);
+      await recordFailedLogin(sql, email);
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
     // SEC-009: Reset failed attempts on successful login
-    await resetFailedLogins(email);
+    await resetFailedLogins(sql, email);
 
     // Sign JWT
     const token = jwt.sign(
@@ -238,6 +272,7 @@ router.post('/logout', (req, res) => {
 // GET /api/auth/me
 router.get('/me', authenticate, async (req, res) => {
   try {
+    const sql = await reserveUser(res, req.user.id);
     const [user] = await sql`
       select id, email, email_verified from profiles where id = ${req.user.id}`;
 
@@ -262,6 +297,7 @@ function generateToken() {
 // POST /api/auth/verify-email
 router.post('/verify-email', async (req, res) => {
   try {
+    const sql = await reserveService(res);
     const { token } = req.body;
 
     if (!token || typeof token !== 'string') {
@@ -289,6 +325,7 @@ router.post('/verify-email', async (req, res) => {
 // POST /api/auth/forgot-password
 router.post('/forgot-password', async (req, res) => {
   try {
+    const sql = await reserveService(res);
     const { email } = req.body;
 
     if (!email || !EMAIL_REGEX.test(email)) {
@@ -323,6 +360,7 @@ router.post('/forgot-password', async (req, res) => {
 // POST /api/auth/reset-password
 router.post('/reset-password', async (req, res) => {
   try {
+    const sql = await reserveService(res);
     const { token, password } = req.body;
 
     if (!token || typeof token !== 'string') {
@@ -367,4 +405,4 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-export { router as authRouter, sql, authenticate };
+export { router as authRouter, sql, authenticate, reserve, reserveService, reserveUser };
