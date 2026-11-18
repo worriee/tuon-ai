@@ -77,7 +77,7 @@ async function resetFailedLogins(sql, email) {
 }
 
 // Postgres client — single pooled connection over Neon (DATABASE_URL includes sslmode=require)
-const sql = postgres(process.env.DATABASE_URL, { max: 10, idle_timeout: 30 });
+const sql = postgres(process.env.DATABASE_URL, { max: 10, idle_timeout: 30, connect_timeout: 8 });
 
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL environment variable is required');

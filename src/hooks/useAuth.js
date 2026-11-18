@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 const API_BASE_URL = "/api";
+const AUTH_TIMEOUT_MS = 20000;
+const AUTH_RETRY_DELAY_MS = 1500;
 
 export function useAuth({ fetchSessions, restoreActiveSession }) {
   const [user, setUser] = useState(null);
@@ -23,6 +25,29 @@ export function useAuth({ fetchSessions, restoreActiveSession }) {
     return Promise.race([promise, timeout]);
   }, []);
 
+  // One auth/me attempt; aborts the fetch when the timeout wins so it stops in flight
+  const fetchSessionOnce = useCallback(async () => {
+    const controller = new AbortController();
+    const request = fetch(`${API_BASE_URL}/auth/me`, {
+      method: "GET",
+      credentials: "include",
+      signal: controller.signal,
+    });
+
+    try {
+      return await withTimeout(
+        request,
+        AUTH_TIMEOUT_MS,
+        "Auth session check",
+      );
+    } catch (error) {
+      controller.abort();
+      // swallow the abort rejection; the caller handles the race error
+      request.catch(() => {});
+      throw error;
+    }
+  }, [withTimeout]);
+
   const logout = useCallback(async () => {
     try {
       await fetch(`${API_BASE_URL}/auth/logout`, {
@@ -43,14 +68,16 @@ export function useAuth({ fetchSessions, restoreActiveSession }) {
 
     const bootSequence = async () => {
       try {
-        const response = await withTimeout(
-          fetch(`${API_BASE_URL}/auth/me`, {
-            method: "GET",
-            credentials: "include",
-          }),
-          5000,
-          "Auth session check",
-        );
+        let response;
+        try {
+          response = await fetchSessionOnce();
+        } catch {
+          // Render cold start: one retry covers a boot still in progress
+          await new Promise((resolve) =>
+            setTimeout(resolve, AUTH_RETRY_DELAY_MS),
+          );
+          response = await fetchSessionOnce();
+        }
 
         if (!response.ok) {
           if (isSubscribed) updateBootStatus("UNAUTHENTICATED");
